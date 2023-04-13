@@ -19,6 +19,7 @@ namespace LxGeo
 		public:
 			std::pair<double, double> xy_constants;
 			std::string height_column_name = "HEIGHT";
+			std::string height_credebility_column_name = "CREDEB";
 			std::string confidence_column_name = "CONF";
 			std::string success_column_name = "SUCCESS";
 			std::string method_column_name = "METHOD";
@@ -53,7 +54,7 @@ namespace LxGeo
 					throw std::runtime_error("Error reading xy_constants from couple file");
 				xy_constants = std::make_pair(loaded_constants[0], loaded_constants[1]);
 
-				init_cpd(OperationDiveStrategy::zoom, 1000.0, 200.0);
+				init_cpd(OperationDiveStrategy::zoom, 1000.0, 100.0);
 
 			}
 
@@ -85,12 +86,12 @@ namespace LxGeo
 					if (!stats.empty()) {
 						gwa.set_double_attribute(height_column_name, stats.percentile(90));
 						double null_percentage =  double(stats.count_null()) / (stats.count()+ stats.count_null());
-						gwa.set_double_attribute("n_perc", null_percentage);
+						gwa.set_double_attribute(height_credebility_column_name, 1.0-null_percentage);
 
 					}
 					else {
 						gwa.set_double_attribute(height_column_name, 0);
-						gwa.set_double_attribute("n_perc", 1);
+						gwa.set_double_attribute(height_credebility_column_name, 0);
 					}
 				}
 			}
@@ -124,20 +125,23 @@ namespace LxGeo
 				const std::pair<double, double>& xy_constants) {
 				
 				assign_heights(in_geovector, respective_dsm);
+				for (auto& gwa : in_geovector ) {
+					gwa.set_string_attribute(method_column_name, "1");
+				}
 				
 				auto success_filter_predicate = [this](const Geometries_with_attributes<Boost_Polygon_2>& feature) {
-					return feature.get_double_attribute("n_perc") < 0.5;
+					return feature.get_double_attribute(height_credebility_column_name) > 0.5;
 				};
 
 				auto polygon_successful_height_assigned = std::views::filter(in_geovector, success_filter_predicate);
 				assign_confidence(polygon_successful_height_assigned, target_proximity_map, xy_constants);
 
 				auto good_confidence_filter_predicate = [this](const Geometries_with_attributes<Boost_Polygon_2>& feature) {
-					return feature.get_double_attribute(confidence_column_name) < 5;
+					return feature.get_double_attribute(confidence_column_name) < 10;
 				};
 
 				for (auto& gwa : std::views::filter(in_geovector, good_confidence_filter_predicate)) {
-					gwa.set_string_attribute(method_column_name, "1");
+					gwa.set_int_attribute(success_column_name, 1);
 				}
 
 			}
@@ -146,22 +150,34 @@ namespace LxGeo
 			void template_matching_alignment_op(Range& in_g_vector, const GeoImage<cv::Mat>& template_ortho, const GeoImage<cv::Mat>& search_ortho,
 				const GeoImage<cv::Mat>& target_proximity_map, const std::pair<double, double>& xy_constants) {
 				using namespace templateMatchingAlignment;
-				int search_radius_pixels = 400;
-				polygonsMatcher::estimate_shift_1d(in_g_vector, template_ortho, search_ortho, TemplateMatchingMethod::ccoef_N, xy_constants, search_radius_pixels, height_column_name, confidence_column_name);
+				int search_radius_pixels = 200;
 
-				auto success_filter_predicate = [this](const Geometries_with_attributes<Boost_Polygon_2>& feature) {
-					return feature.get_double_attribute(confidence_column_name) > 0.3;
+				double rotation_angle = -DEGS(xy_constants.second / xy_constants.first);
+				// Create epipolar images
+				auto epi_template_geoimage = rotate(template_ortho, rotation_angle);
+				auto epi_search_geoimage = rotate(search_ortho, rotation_angle);
+				std::string disp_column_name = "DISP";
+				polygonsMatcher::estimate_disp_1d(in_g_vector, epi_template_geoimage, epi_search_geoimage, TemplateMatchingMethod::ccoef_N, search_radius_pixels, disp_column_name, height_credebility_column_name);
+				
+				double disparity_to_height_scale_factor = 1 * std::abs(template_ortho.geotransform[1]) / numcpp::norm(std::vector<double>({ xy_constants.first, xy_constants.second }));
+				for (auto& gwa : in_g_vector) {
+					gwa.set_string_attribute(method_column_name, "2");
+					gwa.set_double_attribute(height_column_name, gwa.get_double_attribute(disp_column_name)*disparity_to_height_scale_factor);
+				}
+
+				auto confident_filter_predicate = [this](const Geometries_with_attributes<Boost_Polygon_2>& feature) { // template matching cofidence
+					return feature.get_double_attribute(height_credebility_column_name) > 0.3; // depends on TM_* method
 				};
 
-				auto polygon_successful_height_assigned = std::views::filter(in_g_vector, success_filter_predicate);
-				assign_confidence(polygon_successful_height_assigned, target_proximity_map, xy_constants);
+				auto polygon_successful_height_assigned = std::views::filter(in_g_vector, confident_filter_predicate);
+				assign_confidence(polygon_successful_height_assigned, target_proximity_map, xy_constants); // alignment confidence requieres height attribute set
 
 				auto good_confidence_filter_predicate = [this](const Geometries_with_attributes<Boost_Polygon_2>& feature) {
-					return feature.get_double_attribute(confidence_column_name) < 5;
+					return feature.get_double_attribute(confidence_column_name) < 10;
 				};
 
 				for (auto& gwa : std::views::filter(in_g_vector, good_confidence_filter_predicate)) {
-					gwa.set_string_attribute(method_column_name, "2");
+					gwa.set_int_attribute(success_column_name, 1);
 				}
 			}
 
@@ -170,7 +186,9 @@ namespace LxGeo
 				for (auto& gwa : in_g_vector) {
 					gwa.set_string_attribute(method_column_name, "");
 					gwa.set_double_attribute(height_column_name, -1);
-					gwa.set_double_attribute(confidence_column_name, DBL_MAX);
+					gwa.set_double_attribute(confidence_column_name, FLT_MAX);
+					gwa.set_double_attribute(height_credebility_column_name, 0);
+					gwa.set_int_attribute(success_column_name, 0);
 				}
 			}
 
@@ -207,14 +225,14 @@ namespace LxGeo
 				height_alignment_op(polygons2, in_view_pair.raster_views["dsm_2"], contour_proximity_1, { -xy_constants.first, -xy_constants.second });
 
 				auto failure_filter_predicate = [this](const Geometries_with_attributes<Boost_Polygon_2>& feature) {
-					return feature.get_string_attribute(method_column_name).compare("1")!=0;
+					return feature.get_int_attribute(success_column_name)!=1;
 				};
 
 				auto polygon1_remaining = polygons1 | std::views::filter(failure_filter_predicate);
 				auto polygon2_remaining = polygons2 | std::views::filter(failure_filter_predicate);
 
-				template_matching_alignment_op(polygon1_remaining, in_view_pair.raster_views["ortho_1"], in_view_pair.raster_views["ortho_2"], contour_proximity_2,{ -xy_constants.first, -xy_constants.second });
-				template_matching_alignment_op(polygon2_remaining, in_view_pair.raster_views["ortho_2"], in_view_pair.raster_views["ortho_1"], contour_proximity_1, xy_constants);
+				template_matching_alignment_op(polygon1_remaining, in_view_pair.raster_views["ortho_1"], in_view_pair.raster_views["ortho_2"], contour_proximity_2, xy_constants);
+				template_matching_alignment_op(polygon2_remaining, in_view_pair.raster_views["ortho_2"], in_view_pair.raster_views["ortho_1"], contour_proximity_1, { -xy_constants.first, -xy_constants.second });
 				
 				out_view.valid_geometries_indices["al_v1"].idx = 0;
 				out_view.valid_geometries_indices["al_v2"].idx = 0;
