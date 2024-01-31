@@ -8,7 +8,7 @@ namespace LxGeo
 {
 	namespace MSA
 	{
-		class Parameters: public baseParameters
+		class Parameters: public GeometryFactoryShared::baseParameters
 		{
 		public:
 			Parameters(int argc, char* argv[]);
